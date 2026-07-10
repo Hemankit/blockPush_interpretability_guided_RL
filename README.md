@@ -1,157 +1,170 @@
 # BlockPush Interpretability-Guided RL
 
-A research project studying **shortcut learning** in imitation learning policies, using a PyBullet block-pushing environment. The core question: when a neural network policy is trained on data with spurious correlations, can interpretability tools detect the shortcut — and can counterfactual data augmentation fix it?
+This repository studies shortcut learning in a simple PyBullet block-pushing task. A behavioral cloning policy is trained on demonstrations that contain a spurious binary feature, `color_marker`, which is correlated with the correct push direction during training but has no causal effect on the physics. The project asks two practical questions:
 
----
+1. Can simple interpretability checks reveal that the policy is using the shortcut?
+2. Can counterfactual data augmentation reduce that reliance and improve out-of-distribution performance?
 
-## Overview
+## Why this repo exists
 
-A pusher robot must push a block to a goal position. The training data includes a `color_marker` feature that is **spuriously correlated** with the push direction (controlled by `bias_strength`). The ground-truth expert policy deliberately ignores this feature, but a naively trained behavioral cloning policy may learn to rely on it as a shortcut.
+The environment is intentionally minimal so the shortcut is easy to control and measure.
 
-This repo investigates:
-1. **Detection** – Using gradient sensitivity and counterfactual flip tests to measure how much a policy relies on the spurious `color_marker`.
-2. **Mitigation** – Comparing counterfactual data augmentation against baseline and randomization strategies.
-3. **Evaluation** – Measuring OOD performance drop when the spurious correlation is absent at test time.
+- The expert policy uses only geometry: it pushes from the block toward the goal with `atan2(goal_y - block_y, goal_x - block_x)`.
+- The learned policy sees an extra `color_marker` input that may be highly predictive during training.
+- At test time, the spurious correlation can be removed to measure how badly the policy fails when the shortcut stops working.
 
----
+That makes the repository a compact test bed for interpretability-guided robustness experiments.
 
-## Environment
+## Repository overview
 
-The environment (`blockPush.py`) is a PyBullet physics simulation:
+### Core environment and training
 
-- **State vector** (7 features): `[block_x, block_y, pusher_x, pusher_y, goal_x, goal_y, color_marker]`
-- **Action**: push angle (radians), computed as `atan2(goal_y - block_y, goal_x - block_x)`
-- **Spurious feature**: `color_marker` ∈ {0, 1} — binary, correlated with push direction during training at rate `bias_strength`, but causally irrelevant
-- **OOD test**: evaluate with `spurious_correlated=False` so `color_marker` is no longer predictive
+- `blockPush.py` defines the PyBullet environment and the spurious feature injection.
+- `expert_script.py` contains the expert policy used to label demonstrations.
+- `collectdata.py` converts observations into 7D feature vectors and collects training data.
+- `push_policy.py` defines a small MLP and the behavioral cloning training loop.
 
----
+### Analysis and evaluation
 
-## Project Structure
+- `attribution.py` measures shortcut reliance with gradient sensitivity and direct color-flip perturbations.
+- `pre_OOD_evaluation.py` evaluates in-distribution and OOD rollout performance.
+- `paired_rollout.py` compares paired trajectories that differ only in `color_marker`.
+- `three_way_comparison.py` sweeps bias strength and compares offline reliance, closed-loop divergence, and OOD drop.
+- `counterfactual_comparison.py` compares baseline training against randomization and counterfactual augmentation.
 
+### Utility and debugging scripts
+
+- `blockpush_run.py` trains a model and saves basic sanity-check figures.
+- `abalation_run.py` runs attribution-style checks on a saved model.
+- `diagnosis.py` is a lightweight debugging script for stepping through behavior.
+- `concentration_validation_tests/sham_pertubation_plot.py` runs a sham perturbation control.
+
+### Included artifacts
+
+The repository already contains generated outputs such as:
+
+- trained weights in `trained_model.pt`
+- a saved dataset in `train_data.npz`
+- sweep tables in `sweep_results.csv`, `counterfactual_comparison.csv`, `ood_calibration.csv`, and `ood_holdout_predictions.csv`
+- figures such as `sweep_three_way.png`, `counterfactual_comparison.png`, `early_warning_prediction.png`, and `training_loss.png`
+
+## Task setup
+
+Each observation is represented as:
+
+```text
+[block_x, block_y, pusher_x, pusher_y, goal_x, goal_y, color_marker]
 ```
-blockPush_interpretability_guided_RL/
-├── blockPush.py                  # PyBullet block-push environment
-├── expert_script.py              # Ground-truth expert policy (ignores color_marker)
-├── collectdata.py                # Dataset collection: obs → feature vector
-├── push_policy.py                # MLP policy + behavioral cloning (BC) training
-├── attribution.py                # Interpretability: gradient sensitivity & color-flip ablation
-│
-├── blockpush_run.py              # Full training run with atan2 sanity check & loss plots
-├── abalation_run.py              # Load saved model; run both attribution checks
-├── diagnosis.py                  # Environment step-through for debugging
-│
-├── pre_OOD_evaluation.py         # In-distribution vs OOD policy evaluation
-├── paired_rollout.py             # Closed-loop paired rollouts (color 0 vs 1, same physics)
-├── three_way_comparison.py       # Bias-strength sweep: reliance, divergence, OOD drop
-├── counterfactual_comparison.py  # Four training conditions: baseline / blind_rand / double_rand / counterfactual
-│
-├── trained_model.pt              # Saved model weights
-├── train_data.npz                # Saved training dataset
-├── sweep_results.csv             # Results from three_way_comparison sweep
-├── counterfactual_comparison.csv # Results from counterfactual experiment
-├── ood_calibration.csv           # OOD calibration data
-│
-└── concentration_validation_tests/
-    └── sham_pertubation_plot.py  # Sham perturbation control (pusher_pos noise vs color-flip)
-```
 
----
+The policy predicts a single scalar action: the push angle.
 
-## Key Components
+Important details:
 
-### Expert Policy
-The expert (`expert_script.py`) computes the optimal push angle using only block and goal positions:
-```python
-push_angle = atan2(goal_y - block_y, goal_x - block_x)
-```
-It **never** uses `color_marker`. Any policy that learns to use it has learned a shortcut.
+- `color_marker` is binary and non-causal.
+- `bias_strength` controls how strongly `color_marker` aligns with the goal side during training.
+- OOD evaluation disables the correlation so `color_marker` is no longer informative.
 
-### Policy Network
-A 2-layer MLP (`push_policy.py`) trained via MSE behavioral cloning:
-- Input: 7-feature state vector
-- Output: push angle (scalar)
-- Hidden size: 32, activation: ReLU
+## Methods used in the repo
 
-### Interpretability Tools (`attribution.py`)
+### 1. Offline shortcut reliance
 
-| Tool | Method |
-|------|--------|
-| `color_marker_sensitivity` | Gradient `∂angle/∂color_marker` via backprop |
-| `color_flip_test` | `|f(x) - f(x with color flipped)|` — direct causal perturbation |
+`color_flip_test` in `attribution.py` measures how much the predicted angle changes when `color_marker` is flipped while everything else stays fixed.
 
-### Counterfactual Augmentation (`counterfactual_comparison.py`)
+Large changes imply that the network is relying on the shortcut.
 
-Four training conditions compared at each bias level:
+### 2. Closed-loop paired divergence
 
-| Condition | Description | Dataset size |
-|-----------|-------------|--------------|
-| `baseline` | Raw correlated data | N |
-| `blind_rand` | `color_marker` replaced with Bernoulli(0.5) | N |
-| `double_rand` | Original + randomized copy, same labels | 2N |
-| `counterfactual` | Each sample paired with its color-flipped twin | 2N |
+`paired_rollout.py` evaluates whether changing only the spurious feature leads to different behavior in the simulator. This is stricter than an offline perturbation because it measures downstream behavioral divergence.
 
-`counterfactual` vs `double_rand` isolates the benefit of **causal pairing** beyond dataset size.
+### 3. OOD performance drop
 
----
+`pre_OOD_evaluation.py` compares performance when the training correlation is present versus when it is removed. This is the main robustness target.
 
-## Running the Code
+### 4. Counterfactual augmentation
 
-### 1. Install dependencies
+`counterfactual_comparison.py` tests whether pairing each training sample with a color-flipped twin and the same label reduces shortcut use more effectively than naive randomization.
+
+## Installation
+
+This project is plain Python. A virtual environment is recommended.
+
 ```bash
+python -m venv .venv
+.venv\Scripts\activate
 pip install torch numpy matplotlib pandas scipy pybullet
 ```
 
-### 2. Train a model and run sanity checks
+If you already have a Python environment configured, installing the packages above is enough.
+
+## Quick start
+
+### Train a baseline model and generate sanity checks
+
 ```bash
 python blockpush_run.py
 ```
-Generates `atan2_sanity.png` and training loss plots.
 
-### 3. Run attribution ablation on saved model
+This produces figures such as `atan2_sanity.png` and `training_loss.png`.
+
+### Run attribution checks on a saved model
+
 ```bash
 python abalation_run.py
 ```
-Prints gradient magnitudes and color-flip statistics; saves scatter plots.
 
-### 4. Bias-strength sweep (three-way metrics)
+### Run the three-metric sweep
+
 ```bash
 python three_way_comparison.py
 ```
-Sweeps `bias_strength` ∈ {0.6, 0.7, 0.8, 0.9, 0.95, 0.99} across 3 seeds.
-Measures offline reliance, closed-loop behavioral divergence, and OOD performance drop.
-Saves results to `sweep_results.csv`.
 
-### 5. Counterfactual augmentation comparison
+This script sweeps several `bias_strength` values and records:
+
+- offline shortcut reliance
+- closed-loop paired divergence
+- OOD performance drop
+
+Results are saved to `sweep_results.csv` and plotted in `sweep_three_way.png`.
+
+### Compare counterfactual augmentation against baselines
+
 ```bash
 python counterfactual_comparison.py
 ```
-Trains four models per bias level and saves results to `counterfactual_comparison.csv`.
 
-### 6. Sham perturbation validation
+This evaluates four data conditions:
+
+- `baseline`
+- `blind_rand`
+- `double_rand`
+- `counterfactual`
+
+Results are saved to `counterfactual_comparison.csv` and `counterfactual_comparison.png`.
+
+### Run the early-warning OOD analysis
+
 ```bash
-python concentration_validation_tests/sham_pertubation_plot.py
+python pre_OOD_evaluation.py
 ```
-Confirms that `color_flip_test` signal is not an artifact — sham noise on `pusher_pos` produces near-zero response.
 
----
+This script fits a reliance-to-OOD-drop relationship on calibration bias levels, then tests whether reliance can predict OOD failure on held-out bias levels.
 
-## Key Metrics
+## Reading the outputs
 
-- **Offline reliance**: Mean `|Δangle|` from flipping `color_marker` on the training set
-- **Closed-loop divergence**: Mean final-position distance between paired rollouts (color 0 vs 1, same physics)
-- **OOD drop**: `mean_dist_OOD − mean_dist_in_dist` — positive = worse OOD performance, indicating shortcut use
+The main quantities to pay attention to are:
 
----
+- `reliance`: average change in predicted angle after flipping `color_marker`
+- `closed_loop_divergence`: behavioral difference between paired rollouts
+- `drop`: OOD distance minus in-distribution distance
 
-## Results Summary
+Lower is generally better for all three.
 
-Higher `bias_strength` → stronger spurious correlation → higher shortcut reliance → larger OOD performance drop. Counterfactual augmentation reduces reliance by forcing the model to produce the same output regardless of `color_marker`, directly breaking the shortcut during training.
+## Notes
 
----
+- This repository contains both source code and generated experiment artifacts.
+- File names reflect the current repo state, including `abalation_run.py` and `sham_pertubation_plot.py`.
+- The project appears intended for local experimentation rather than packaged distribution.
 
-## Dependencies
+## Suggested citation context
 
-- Python 3.8+
-- [PyTorch](https://pytorch.org/)
-- [PyBullet](https://pybullet.org/)
-- NumPy, Matplotlib, Pandas, SciPy
+If you use this code in a report or project write-up, describe it as a toy PyBullet benchmark for studying shortcut reliance in imitation learning with counterfactual interventions.
